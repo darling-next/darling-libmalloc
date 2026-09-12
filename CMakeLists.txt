@@ -55,3 +55,8 @@ add_circular(system_malloc FAT
 )
 
 install(TARGETS system_malloc DESTINATION libexec/darling/usr/lib/system)
+
+option(DARLING_MALLOC_REGION_TEST "Build native retained-region regression" OFF)
+if(DARLING_MALLOC_REGION_TEST)
+	add_darling_executable(rack_region_generation tests/rack_region_generation.c)
+endif()
