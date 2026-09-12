@@ -799,8 +799,12 @@ szone_check_all(szone_t *szone, const char *function)
 	size_t index;
 
 	/* check tiny regions - chould check region count */
-	for (index = 0; index < szone->tiny_rack.region_generation->num_regions_allocated; ++index) {
-		region_t tiny = szone->tiny_rack.region_generation->hashed_regions[index];
+	for (index = 0; ; ++index) {
+		region_hash_generation_t *generation = os_atomic_load(&szone->tiny_rack.region_generation, acquire);
+		if (index >= generation->num_regions_allocated) {
+			break;
+		}
+		region_t tiny = generation->hashed_regions[index];
 
 		if (HASHRING_REGION_DEALLOCATED == tiny) {
 			continue;
@@ -828,8 +832,12 @@ szone_check_all(szone_t *szone, const char *function)
 	}
 
 	/* check small regions - could check region count */
-	for (index = 0; index < szone->small_rack.region_generation->num_regions_allocated; ++index) {
-		region_t small = szone->small_rack.region_generation->hashed_regions[index];
+	for (index = 0; ; ++index) {
+		region_hash_generation_t *generation = os_atomic_load(&szone->small_rack.region_generation, acquire);
+		if (index >= generation->num_regions_allocated) {
+			break;
+		}
+		region_t small = generation->hashed_regions[index];
 
 		if (HASHRING_REGION_DEALLOCATED == small) {
 			continue;
@@ -859,8 +867,12 @@ szone_check_all(szone_t *szone, const char *function)
 #if CONFIG_MEDIUM_ALLOCATOR
 	if (szone->is_medium_engaged) {
 		/* check medium regions - could check region count */
-		for (index = 0; index < szone->medium_rack.region_generation->num_regions_allocated; ++index) {
-			region_t medium = szone->medium_rack.region_generation->hashed_regions[index];
+		for (index = 0; ; ++index) {
+			region_hash_generation_t *generation = os_atomic_load(&szone->medium_rack.region_generation, acquire);
+			if (index >= generation->num_regions_allocated) {
+				break;
+			}
+			region_t medium = generation->hashed_regions[index];
 
 			if (HASHRING_REGION_DEALLOCATED == medium) {
 				continue;
@@ -1060,7 +1072,7 @@ szone_print(task_t task, unsigned level, vm_address_t zone_address,
 	region_hash_generation_t *mapped_region_generation;
 	region_t *mapped_hashed_regions;
 	magazine_t *mapped_magazines;
-	if (reader(task, (vm_address_t)mapped_szone->tiny_rack.region_generation,
+	if (reader(task, (vm_address_t)os_atomic_load(&mapped_szone->tiny_rack.region_generation, acquire),
 			sizeof(region_hash_generation_t), (void **)&mapped_region_generation)) {
 		printer("Failed to map tiny rack region_generation\n");
 		return;
@@ -1126,7 +1138,7 @@ szone_print(task_t task, unsigned level, vm_address_t zone_address,
 		printer("[%lu small regions have been vm_deallocate'd]\n",
 				mapped_szone->small_rack.num_regions_dealloc);
 	}
-	if (reader(task, (vm_address_t)mapped_szone->small_rack.region_generation,
+	if (reader(task, (vm_address_t)os_atomic_load(&mapped_szone->small_rack.region_generation, acquire),
 			sizeof(region_hash_generation_t), (void **)&mapped_region_generation)) {
 		printer("Failed to map small rack region_generation\n");
 		return;
@@ -1194,7 +1206,7 @@ szone_print(task_t task, unsigned level, vm_address_t zone_address,
 			printer("[%lu medium regions have been vm_deallocate'd]\n",
 					mapped_szone->medium_rack.num_regions_dealloc);
 		}
-		if (reader(task, (vm_address_t)mapped_szone->medium_rack.region_generation,
+		if (reader(task, (vm_address_t)os_atomic_load(&mapped_szone->medium_rack.region_generation, acquire),
 				sizeof(region_hash_generation_t), (void **)&mapped_region_generation)) {
 			printer("Failed to map medium rack region_generation\n");
 			return;

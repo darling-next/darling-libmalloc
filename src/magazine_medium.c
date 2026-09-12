@@ -1071,8 +1071,12 @@ medium_madvise_pressure_relief(rack_t *rack)
 
 	for (mag_index = 0; mag_index < rack->num_magazines; mag_index++) {
 		size_t index;
-		for (index = 0; index < rack->region_generation->num_regions_allocated; ++index) {
+		for (index = 0; ; ++index) {
 			rack_region_lock(rack);
+			if (index >= rack->region_generation->num_regions_allocated) {
+				rack_region_unlock(rack);
+				break;
+			}
 
 			region_t medium = rack->region_generation->hashed_regions[index];
 			if (!medium || medium == HASHRING_REGION_DEALLOCATED) {
@@ -2105,7 +2109,7 @@ medium_in_use_enumerator(task_t task,
 	magazine_t *medium_mag_base = NULL;
 
 	region_hash_generation_t *srg_ptr;
-	err = reader(task, (vm_address_t)szone->medium_rack.region_generation, sizeof(region_hash_generation_t), (void **)&srg_ptr);
+	err = reader(task, (vm_address_t)os_atomic_load(&szone->medium_rack.region_generation, acquire), sizeof(region_hash_generation_t), (void **)&srg_ptr);
 	if (err) {
 		return err;
 	}

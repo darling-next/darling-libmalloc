@@ -42,7 +42,7 @@ typedef struct region_hash_generation {
 	size_t num_regions_allocated;
 	size_t num_regions_allocated_shift; // log2(num_regions_allocated)
 	region_t *hashed_regions;			// hashed by location
-	struct region_hash_generation *nextgen;
+	struct region_hash_generation *nextgen; // immutable link to the previous generation
 } region_hash_generation_t;
 
 OS_ENUM(rack_type, uint32_t,

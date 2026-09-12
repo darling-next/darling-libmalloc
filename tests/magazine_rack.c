@@ -34,6 +34,28 @@ T_DECL(basic_magazine_deinit, "allocate deallocate magazines")
 	T_ASSERT_NULL(rack.magazines, "magazine deinit");
 }
 
+T_DECL(rack_region_generation_retained, "region lookup survives two intervening table growths")
+{
+	rack_t rack = {0};
+	rack_init(&rack, RACK_TYPE_TINY, 1, 0);
+	// Region indexing never dereferences these synthetic, aligned addresses.
+	region_t anchor = (region_t)((uintptr_t)1 << HASH_BLOCKS_ALIGN);
+	rack_region_insert(&rack, anchor);
+	region_hash_generation_t *saved = os_atomic_load(&rack.region_generation, acquire);
+	region_t *table = saved->hashed_regions;
+
+	// Pause a reader between loading its table and the rest of its geometry.
+	// Two growths used to overwrite the descriptor that the reader retained.
+	for (size_t i = 2; i <= 2 * INITIAL_NUM_REGIONS; ++i) {
+		rack_region_insert(&rack, (region_t)((uintptr_t)i << HASH_BLOCKS_ALIGN));
+	}
+	rgnhdl_t slot = hash_lookup_region_no_lock(table, saved->num_regions_allocated,
+			saved->num_regions_allocated_shift, anchor);
+	T_ASSERT_NOTNULL(slot, "paused reader still finds its registered region");
+	T_ASSERT_EQ(*slot, anchor, "lookup preserves the region identity");
+	rack_destroy(&rack);
+}
+
 void *
 pressure_thread(void *arg)
 {

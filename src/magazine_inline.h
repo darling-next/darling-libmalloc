@@ -401,15 +401,15 @@ hash_region_insert_no_lock(region_t *regions, size_t num_entries, size_t shift, 
 }
 
 /*
- * hash_regions_alloc_no_lock - Allocate space for a number of entries.  This
- * must be a VM allocation as to avoid recursing between allocating a new small
+ * hash_regions_alloc_no_lock - Allocate entries and their retained descriptor.
+ * This must be a VM allocation as to avoid recursing between allocating a small
  * region, and asking the small region to allocate space for the new list of
  * regions.
  */
 static region_t *
 hash_regions_alloc_no_lock(size_t num_entries)
 {
-	size_t size = num_entries * sizeof(region_t);
+	size_t size = num_entries * sizeof(region_t) + sizeof(region_hash_generation_t);
 	return mvm_allocate_pages(round_page_quanta(size), 0, DISABLE_ASLR, VM_MEMORY_MALLOC);
 }
 
@@ -525,9 +525,10 @@ region_set_cookie(region_cookie_t *cookiep)
 static MALLOC_INLINE region_t
 tiny_region_for_ptr_no_lock(rack_t *rack, const void *ptr)
 {
-	rgnhdl_t r = hash_lookup_region_no_lock(rack->region_generation->hashed_regions,
-			rack->region_generation->num_regions_allocated,
-			rack->region_generation->num_regions_allocated_shift,
+	region_hash_generation_t *generation = os_atomic_load(&rack->region_generation, acquire);
+	rgnhdl_t r = hash_lookup_region_no_lock(generation->hashed_regions,
+			generation->num_regions_allocated,
+			generation->num_regions_allocated_shift,
 			TINY_REGION_FOR_PTR(ptr));
 
 	return r ? *r : r;
@@ -653,8 +654,9 @@ tiny_magazine_below_recirc_threshold(magazine_t *mag_ptr)
 static MALLOC_INLINE region_t
 small_region_for_ptr_no_lock(rack_t *rack, const void *ptr)
 {
-	rgnhdl_t r = hash_lookup_region_no_lock(rack->region_generation->hashed_regions,
-			rack->region_generation->num_regions_allocated, rack->region_generation->num_regions_allocated_shift,
+	region_hash_generation_t *generation = os_atomic_load(&rack->region_generation, acquire);
+	rgnhdl_t r = hash_lookup_region_no_lock(generation->hashed_regions,
+			generation->num_regions_allocated, generation->num_regions_allocated_shift,
 			SMALL_REGION_FOR_PTR(ptr));
 	return r ? *r : r;
 }
@@ -704,8 +706,9 @@ medium_region_below_recirc_threshold(region_t region)
 static MALLOC_INLINE region_t
 medium_region_for_ptr_no_lock(rack_t *rack, const void *ptr)
 {
-	rgnhdl_t r = hash_lookup_region_no_lock(rack->region_generation->hashed_regions,
-			rack->region_generation->num_regions_allocated, rack->region_generation->num_regions_allocated_shift,
+	region_hash_generation_t *generation = os_atomic_load(&rack->region_generation, acquire);
+	rgnhdl_t r = hash_lookup_region_no_lock(generation->hashed_regions,
+			generation->num_regions_allocated, generation->num_regions_allocated_shift,
 			MEDIUM_REGION_FOR_PTR(ptr));
 	return r ? *r : r;
 }
