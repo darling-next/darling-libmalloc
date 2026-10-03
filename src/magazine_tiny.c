@@ -835,8 +835,12 @@ tiny_madvise_pressure_relief(rack_t *rack)
 
 	for (mag_index = 0; mag_index < rack->num_magazines; mag_index++) {
 		size_t index;
-		for (index = 0; index < rack->region_generation->num_regions_allocated; ++index) {
+		for (index = 0; ; ++index) {
 			rack_region_lock(rack);
+			if (index >= rack->region_generation->num_regions_allocated) {
+				rack_region_unlock(rack);
+				break;
+			}
 
 			region_t tiny = rack->region_generation->hashed_regions[index];
 			if (!tiny || tiny == HASHRING_REGION_DEALLOCATED) {
@@ -1860,7 +1864,7 @@ tiny_in_use_enumerator(task_t task,
 	magazine_t *tiny_mag_base = NULL;
 
 	region_hash_generation_t *trg_ptr;
-	err = reader(task, (vm_address_t)szone->tiny_rack.region_generation, sizeof(region_hash_generation_t), (void **)&trg_ptr);
+	err = reader(task, (vm_address_t)os_atomic_load(&szone->tiny_rack.region_generation, acquire), sizeof(region_hash_generation_t), (void **)&trg_ptr);
 	if (err) {
 		return err;
 	}

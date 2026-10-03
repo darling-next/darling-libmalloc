@@ -27,8 +27,8 @@ void
 rack_init(rack_t *rack, rack_type_t type, uint32_t num_magazines, uint32_t debug_flags)
 {
 	rack->type = type;
-	rack->rg[0].nextgen = &rack->rg[1];
-	rack->rg[1].nextgen = &rack->rg[0];
+	rack->rg[0].nextgen = NULL;
+	rack->rg[1].nextgen = NULL;
 	rack->region_generation = &rack->rg[0];
 
 	rack->region_generation->hashed_regions = rack->initial_regions;
@@ -101,10 +101,14 @@ rack_destroy_regions(rack_t *rack, size_t region_size)
 void
 rack_destroy(rack_t *rack)
 {
-	/* if the rack has additional regions, then deallocate them */
-	if (rack->region_generation->hashed_regions != rack->initial_regions) {
-		size_t size = round_page_quanta(rack->region_generation->num_regions_allocated * sizeof(region_t));
-		mvm_deallocate_pages(rack->region_generation->hashed_regions, size, 0);
+	/* Destruction is quiescent; retain every published generation until then. */
+	region_hash_generation_t *generation = rack->region_generation;
+	while (generation->hashed_regions != rack->initial_regions) {
+		region_hash_generation_t *previous = generation->nextgen;
+		size_t size = round_page_quanta(generation->num_regions_allocated * sizeof(region_t) +
+				sizeof(region_hash_generation_t));
+		mvm_deallocate_pages(generation->hashed_regions, size, 0);
+		generation = previous;
 	}
 
 	if (rack->num_magazines > 0) {
@@ -135,19 +139,14 @@ rack_region_insert(rack_t *rack, region_t region)
 		size_t new_shift = rack->region_generation->num_regions_allocated_shift; // In/Out parameter
 		new_regions = hash_regions_grow_no_lock(rack->region_generation->hashed_regions,
 												rack->region_generation->num_regions_allocated, &new_shift, &new_size);
-		// Do not deallocate the current hashed_regions allocation since someone may
-		// be iterating it.  Instead, just leak it.
-
-		// Prepare to advance to the "next generation" of the hash ring.
-		rack->region_generation->nextgen->hashed_regions = new_regions;
-		rack->region_generation->nextgen->num_regions_allocated = new_size;
-		rack->region_generation->nextgen->num_regions_allocated_shift = new_shift;
-
-		// Ensure everyone sees the advance.
-		OSMemoryBarrier();
-
-		// Throw the switch to atomically advance to the next generation.
-		rack->region_generation = rack->region_generation->nextgen;
+		// Readers can remain on any older generation across multiple growths.
+		// Keep its descriptor immutable, coallocated after its retained table.
+		region_hash_generation_t *next = (region_hash_generation_t *)(new_regions + new_size);
+		next->hashed_regions = new_regions;
+		next->num_regions_allocated = new_size;
+		next->num_regions_allocated_shift = new_shift;
+		next->nextgen = rack->region_generation;
+		os_atomic_store(&rack->region_generation, next, release);
 	}
 
 	// Insert the new region into the hash ring, and update malloc statistics
