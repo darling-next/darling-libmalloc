@@ -21,6 +21,10 @@
  * @APPLE_LICENSE_HEADER_END@
  */
 
+#include <signal.h>
+#include <sys/ucontext.h>
+#include <string.h>
+#include <unistd.h>
 #include "internal.h"
 
 #if TARGET_OS_IPHONE
@@ -45,6 +49,100 @@ static _malloc_lock_s _malloc_lock = _MALLOC_LOCK_INIT;
  * provided that when malloc_destroy_zone is called all prior operations on that
  * zone are complete and no further calls referencing that zone can be made.
  */
+/* Diagnostic ring: last N allocation/free events, so a fault's address can be matched against an allocation
+ * history this tree does not otherwise provide (no stack-log emitter, no exported hook). Enabled by
+ * MALLOC_TRACE_RING=1 and installed lazily on the first allocator entry -- a constructor in this dylib was
+ * measured to break guest startup (2026-10-23), so nothing here runs before the allocator itself is in use. */
+#define DARL_TRACE_N 1048576
+struct darl_trace_entry { uintptr_t op, addr, size, caller; };
+static struct darl_trace_entry darl_trace_ring[DARL_TRACE_N];
+static volatile unsigned long darl_trace_idx = 0;
+static volatile int darl_trace_state = 0;      /* 0 unset, 3 installing, 1 enabled, 2 disabled */
+static volatile int darl_trace_in_handler = 0;
+
+static void darl_trace_dump(void *fault)
+{
+	char buf[192];
+	int n = snprintf(buf, sizeof buf, "[malloc-trace] fault=%p entries=%lu\n", fault, darl_trace_idx);
+	if (n > 0) write(2, buf, n);
+	unsigned long end = darl_trace_idx;
+	unsigned long start = end > 64 ? end - 64 : 0;
+	for (unsigned long i = start; i < end; i++) {
+		struct darl_trace_entry *e = &darl_trace_ring[i % DARL_TRACE_N];
+		n = snprintf(buf, sizeof buf, "[malloc-trace] #%lu %s addr=%p size=%lu caller=%p\n",
+					 i, e->op ? "free" : "alloc", (void *)e->addr, (unsigned long)e->size, (void *)e->caller);
+		if (n > 0) write(2, buf, n);
+	}
+}
+
+static void darl_trace_dump_object(uintptr_t obj);
+
+static void darl_trace_signal(int sig, siginfo_t *si, void *ctx)
+{
+	if (darl_trace_in_handler) return;
+	darl_trace_in_handler = 1;
+	darl_trace_dump(si ? si->si_addr : 0);
+#if defined(__x86_64__)
+	/* rdi holds the receiver of the failing objc_msgSend; its allocation history is what we are after. */
+	if (ctx != NULL && sig == SIGSEGV) {
+		ucontext_t *uc = (ucontext_t *)ctx;
+		darl_trace_dump_object((uintptr_t)uc->uc_mcontext->__ss.__rdi);
+	}
+#else
+	(void)ctx;
+#endif
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
+/* Print every ring entry that mentions obj: who allocated it, who freed it, and what reused the address. */
+static void darl_trace_dump_object(uintptr_t obj)
+{
+	if (obj == 0) return;
+	char buf[192];
+	int n = snprintf(buf, sizeof buf, "[malloc-trace] object=%p history:\n", (void *)obj);
+	if (n > 0) write(2, buf, n);
+	unsigned long end = darl_trace_idx;
+	unsigned long start = end > DARL_TRACE_N ? end - DARL_TRACE_N : 0;
+	for (unsigned long i = start; i < end; i++) {
+		struct darl_trace_entry *e = &darl_trace_ring[i % DARL_TRACE_N];
+		if (e->addr != obj) continue;
+		n = snprintf(buf, sizeof buf, "[malloc-trace] obj #%lu %s size=%lu caller=%p\n",
+					 i, e->op ? "free" : "alloc", (unsigned long)e->size, (void *)e->caller);
+		if (n > 0) write(2, buf, n);
+	}
+}
+
+static void darl_trace_logger(uint32_t type, uintptr_t arg1, uintptr_t arg2, uintptr_t arg3, uintptr_t result, uint32_t skip)
+{
+	(void)arg1; (void)arg3; (void)skip;
+	if (darl_trace_in_handler || darl_trace_state != 1) return;
+	int isFree = (type & 4u) != 0;   /* stack_logging_type_dealloc */
+	unsigned long i = __sync_fetch_and_add(&darl_trace_idx, 1);
+	struct darl_trace_entry *e = &darl_trace_ring[i % DARL_TRACE_N];
+	e->op = isFree ? 1 : 0;
+	e->addr = isFree ? arg2 : result;
+	e->size = isFree ? 0 : arg2;
+	e->caller = (uintptr_t)__builtin_return_address(2);
+}
+
+static void darl_trace_maybe_init(void)
+{
+	if (darl_trace_state != 0) return;
+	darl_trace_state = 3;               /* guard against re-entry through getenv/sigaction */
+	const char *e = getenv("MALLOC_TRACE_RING");
+	if (e == NULL || *e == 0 || *e == '0') { darl_trace_state = 2; return; }
+	struct sigaction sa;
+	memset(&sa, 0, sizeof sa);
+	sa.sa_sigaction = darl_trace_signal;
+	sa.sa_flags = SA_SIGINFO;
+	sigaction(SIGSEGV, &sa, NULL);
+	sigaction(SIGABRT, &sa, NULL);
+	sigaction(SIGTRAP, &sa, NULL);
+	malloc_logger = darl_trace_logger;
+	darl_trace_state = 1;
+}
+
 int32_t malloc_num_zones = 0;
 int32_t malloc_num_zones_allocated = 0;
 malloc_zone_t **malloc_zones = (malloc_zone_t **)0xdeaddeaddeaddead;
@@ -1560,6 +1658,8 @@ _malloc_zone_malloc(malloc_zone_t *zone, size_t size, malloc_zone_options_t mzo)
 {
 	MALLOC_TRACE(TRACE_malloc | DBG_FUNC_START, (uintptr_t)zone, size, 0, 0);
 
+	darl_trace_maybe_init();
+
 	void *ptr = NULL;
 
 	if (malloc_check_start) {
@@ -1683,6 +1783,7 @@ malloc_zone_free(malloc_zone_t *zone, void *ptr)
 {
 	MALLOC_TRACE(TRACE_free, (uintptr_t)zone, (uintptr_t)ptr, (ptr) ? *(uintptr_t*)ptr : 0, 0);
 
+	darl_trace_maybe_init();
 	if (os_unlikely(malloc_logger)) {
 		malloc_logger(MALLOC_LOG_TYPE_DEALLOCATE | MALLOC_LOG_TYPE_HAS_ZONE, (uintptr_t)zone, (uintptr_t)ptr, 0, 0, 0);
 	}
