@@ -75,13 +75,53 @@ static void darl_trace_dump(void *fault)
 	}
 }
 
+/* The fault is inside a leaf (objc_msgSend), so the core's unwinder stops there. Walking the frame-pointer
+ * chain from the signal context names the function that made the call -- for the retained-after-free case this
+ * is the owner of the stale reference, which is the fact no other instrument in this tree can supply. */
+static void darl_trace_dump_stack(void *ctx)
+{
+#if defined(__x86_64__)
+	ucontext_t *uc = (ucontext_t *)ctx;
+	uintptr_t rbp = (uintptr_t)uc->uc_mcontext->__ss.__rbp;
+	uintptr_t rsp = (uintptr_t)uc->uc_mcontext->__ss.__rsp;
+	char buf[160];
+	int n = snprintf(buf, sizeof buf, "[malloc-trace] rsp=%p rbp=%p\n", (void *)rsp, (void *)rbp);
+	if (n > 0) write(2, buf, n);
+	for (int depth = 0; depth < 5; depth++) {
+		if (!(rbp > rsp && rbp < rsp + (8u << 20) && (rbp & 7) == 0)) break;
+		uintptr_t ret = *(uintptr_t *)(rbp + 8);
+		uintptr_t next = *(uintptr_t *)rbp;
+		n = snprintf(buf, sizeof buf, "[malloc-trace] frame#%d ret=%p\n", depth, (void *)ret);
+		if (n > 0) write(2, buf, n);
+		if (!(next > rbp && next < rbp + (8u << 20) && (next & 7) == 0)) break;
+		rbp = next;
+	}
+#else
+	(void)ctx;
+#endif
+}
+
 static void darl_trace_dump_object(uintptr_t obj);
+
+/* Exported so a higher-level library (CoreFoundation) can annotate an address with the identity it knows
+ * -- a CF type id and the call site -- and have that annotation appear in the fault dump below. */
+void _darl_trace_note(uintptr_t addr, uintptr_t a, uintptr_t b)
+{
+	if (darl_trace_state != 1) return;
+	unsigned long i = __sync_fetch_and_add(&darl_trace_idx, 1);
+	struct darl_trace_entry *e = &darl_trace_ring[i % DARL_TRACE_N];
+	e->op = 2;
+	e->addr = addr;
+	e->size = a;
+	e->caller = b;
+}
 
 static void darl_trace_signal(int sig, siginfo_t *si, void *ctx)
 {
 	if (darl_trace_in_handler) return;
 	darl_trace_in_handler = 1;
 	darl_trace_dump(si ? si->si_addr : 0);
+	darl_trace_dump_stack(ctx);
 #if defined(__x86_64__)
 	/* rdi holds the receiver of the failing objc_msgSend; its allocation history is what we are after. */
 	if (ctx != NULL && sig == SIGSEGV) {
@@ -107,8 +147,13 @@ static void darl_trace_dump_object(uintptr_t obj)
 	for (unsigned long i = start; i < end; i++) {
 		struct darl_trace_entry *e = &darl_trace_ring[i % DARL_TRACE_N];
 		if (e->addr != obj) continue;
-		n = snprintf(buf, sizeof buf, "[malloc-trace] obj #%lu %s size=%lu caller=%p\n",
-					 i, e->op ? "free" : "alloc", (unsigned long)e->size, (void *)e->caller);
+		if (e->op == 2) {
+			n = snprintf(buf, sizeof buf, "[malloc-trace] obj #%lu note id=%lu site=%p\n",
+						 i, (unsigned long)e->size, (void *)e->caller);
+		} else {
+			n = snprintf(buf, sizeof buf, "[malloc-trace] obj #%lu %s size=%lu caller=%p\n",
+						 i, e->op ? "free" : "alloc", (unsigned long)e->size, (void *)e->caller);
+		}
 		if (n > 0) write(2, buf, n);
 	}
 }
@@ -126,12 +171,30 @@ static void darl_trace_logger(uint32_t type, uintptr_t arg1, uintptr_t arg2, uin
 	e->caller = (uintptr_t)__builtin_return_address(2);
 }
 
+/* One switch for every in-process diagnostic this tree carries: DARLING_DIAG=alloc,url-free,url-life,url-cache.
+ * The per-knob variables stay honoured so existing recipes keep working, but a session should not have to discover
+ * four names: the registry is documented in docs/tooling.md and the darling-diagnostics skill. */
+int __darl_diag_has(const char *token)
+{
+	static const char *all = NULL;
+	static int cached = 0;
+	if (!cached) { all = getenv("DARLING_DIAG"); cached = 1; }
+	if (all == NULL || *all == 0) return 0;
+	size_t n = strlen(token);
+	for (const char *p = all; (p = strstr(p, token)) != NULL; p += n) {
+		int before = (p == all) || (p[-1] == ',');
+		int after = (p[n] == 0) || (p[n] == ',');
+		if (before && after) return 1;
+	}
+	return 0;
+}
+
 static void darl_trace_maybe_init(void)
 {
 	if (darl_trace_state != 0) return;
 	darl_trace_state = 3;               /* guard against re-entry through getenv/sigaction */
 	const char *e = getenv("MALLOC_TRACE_RING");
-	if (e == NULL || *e == 0 || *e == '0') { darl_trace_state = 2; return; }
+	if ((e == NULL || *e == 0 || *e == '0') && !__darl_diag_has("alloc")) { darl_trace_state = 2; return; }
 	struct sigaction sa;
 	memset(&sa, 0, sizeof sa);
 	sa.sa_sigaction = darl_trace_signal;
